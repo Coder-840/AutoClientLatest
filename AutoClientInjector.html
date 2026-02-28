@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoClient HTML Injector</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; max-width: 900px; }
+    .card { border: 1px solid #ccc; border-radius: 8px; padding: 1rem 1.25rem; margin-top: 1rem; }
+    button { padding: 0.5rem 0.9rem; cursor: pointer; }
+    pre { background: #f6f8fa; padding: 0.75rem; border-radius: 6px; overflow: auto; }
+    .ok { color: #0a7a2f; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>AutoClient Key/Input Fix Injector</h1>
+  <p>Upload the original <code>AutoClient.html</code>. This tool decodes and validates the embedded EPW payload and injects a targeted key handling patch at the start of script #3 (right after the <code>assetsURI</code> assignment), not at the end of the file.</p>
+
+  <div class="card">
+    <input id="fileInput" type="file" accept=".html,text/html" />
+    <button id="injectBtn">Inject Fix</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <h3>What is patched</h3>
+    <ul>
+      <li>Blocks <code>ShiftRight</code> from toggling GUI while typing in input/textarea/contenteditable fields.</li>
+      <li>Normalizes <code>keyCode</code>/<code>which</code> from <code>event.code</code> for legacy keybind logic (e.g. modules bound to letter keys like <code>X</code>).</li>
+    </ul>
+  </div>
+
+  <script>
+    const PATCH_MARKER = "/* AUTCLIENT_KEYPATCH_V1 */";
+
+    const PATCH_SNIPPET = `${PATCH_MARKER}
+(function() {
+  const VK_MAP = {
+    ShiftLeft: 16, ShiftRight: 16, ControlLeft: 17, ControlRight: 17, AltLeft: 18, AltRight: 18,
+    Space: 32, Enter: 13, Escape: 27, Tab: 9, Backspace: 8,
+    ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+    Insert: 45, Delete: 46, Home: 36, End: 35, PageUp: 33, PageDown: 34,
+    CapsLock: 20
+  };
+  for(let i = 1; i <= 12; i++) VK_MAP['F' + i] = 111 + i;
+  for(let i = 0; i <= 9; i++) VK_MAP['Digit' + i] = 48 + i;
+  for(let i = 0; i < 26; i++) VK_MAP['Key' + String.fromCharCode(65 + i)] = 65 + i;
+
+  const isTypingTarget = (el) => {
+    if(!el) return false;
+    if(el.isContentEditable) return true;
+    const tag = (el.tagName || '').toUpperCase();
+    if(tag === 'TEXTAREA') return true;
+    if(tag !== 'INPUT') return false;
+    const t = (el.type || 'text').toLowerCase();
+    return !['button','submit','checkbox','radio','range','color','file','image','reset'].includes(t);
+  };
+
+  const patchEvent = (ev) => {
+    const active = document.activeElement;
+    const typing = isTypingTarget(ev.target) || isTypingTarget(active);
+
+    if(typing && ev.code === 'ShiftRight') {
+      ev.stopImmediatePropagation();
+      return;
+    }
+
+    const vk = VK_MAP[ev.code];
+    if(!vk) return;
+
+    try {
+      if(ev.keyCode === 0) Object.defineProperty(ev, 'keyCode', { configurable: true, get: () => vk });
+      if(ev.which === 0) Object.defineProperty(ev, 'which', { configurable: true, get: () => vk });
+    } catch(_) {
+      // ignored: browser may lock event props
+    }
+  };
+
+  window.addEventListener('keydown', patchEvent, true);
+  window.addEventListener('keyup', patchEvent, true);
+})();
+`;
+
+    function setStatus(msg, ok = true) {
+      const el = document.getElementById('status');
+      el.className = ok ? 'ok' : 'err';
+      el.innerHTML = msg;
+    }
+
+    function b64ToBytes(b64) {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+
+    function u32le(buf, off) {
+      return (buf[off]) | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24 >>> 0);
+    }
+
+    function inject(html) {
+      if (html.includes(PATCH_MARKER)) {
+        throw new Error('This file already appears patched (marker found).');
+      }
+
+      const sig = 'window.eaglercraftXOpts.assetsURI = "data:application/octet-stream;base64,';
+      const sigPos = html.indexOf(sig);
+      if (sigPos < 0) throw new Error('Could not find assetsURI assignment in script #3.');
+
+      const b64Start = sigPos + sig.length;
+      const quoteEnd = html.indexOf('";', b64Start);
+      if (quoteEnd < 0) throw new Error('Could not locate end of embedded EPW data URI.');
+
+      const uri = 'data:application/octet-stream;base64,' + html.slice(b64Start, quoteEnd);
+      if (!uri.startsWith('data:application/octet-stream;base64,')) {
+        throw new Error('assetsURI did not match expected data URI format.');
+      }
+
+      const b64 = uri.slice('data:application/octet-stream;base64,'.length);
+      const epw = b64ToBytes(b64);
+
+      if (epw.length < 188) throw new Error('Decoded EPW is too short.');
+      const magic0 = u32le(epw, 0), magic1 = u32le(epw, 4), len = u32le(epw, 8);
+      if (magic0 !== 608649541 || magic1 !== 1297301847) throw new Error('EPW header magic mismatch.');
+      if (len !== epw.length) throw new Error(`EPW length mismatch: header=${len}, actual=${epw.length}`);
+
+      const injectAnchor = '\n\n\tvar launchInterval = -1;';
+      const anchorPos = html.indexOf(injectAnchor, quoteEnd);
+      if (anchorPos < 0) {
+        throw new Error('Could not find launch bootstrap anchor after assetsURI; refusing blind injection.');
+      }
+
+      const patched = html.slice(0, anchorPos) + '\n\n\t' + PATCH_SNIPPET.replace(/\n/g, '\n\t') + html.slice(anchorPos);
+
+      return {
+        patched,
+        details: {
+          epwBytes: epw.length,
+          splashOffset: u32le(epw, 100),
+          splashLength: u32le(epw, 104),
+          loaderJsOffset: u32le(epw, 164),
+          loaderJsLength: u32le(epw, 168),
+          loaderWasmOffset: u32le(epw, 180),
+          loaderWasmLength: u32le(epw, 184)
+        }
+      };
+    }
+
+    document.getElementById('injectBtn').addEventListener('click', async () => {
+      const file = document.getElementById('fileInput').files[0];
+      if (!file) {
+        setStatus('Select an HTML file first.', false);
+        return;
+      }
+
+      try {
+        const html = await file.text();
+        const { patched, details } = inject(html);
+        const outName = file.name.replace(/\.html?$/i, '') + '.patched.html';
+        const blob = new Blob([patched], { type: 'text/html;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = outName;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        setStatus(
+          `Patched successfully. Downloaded <b>${outName}</b>.<br><pre>${JSON.stringify(details, null, 2)}</pre>`,
+          true
+        );
+      } catch (e) {
+        setStatus(`Injection failed: ${e.message}`, false);
+      }
+    });
+  </script>
+</body>
+</html>
